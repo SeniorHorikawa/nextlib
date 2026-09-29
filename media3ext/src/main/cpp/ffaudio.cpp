@@ -224,7 +224,7 @@ int decodePacket(AVCodecContext *context, AVPacket *packet,
             //   这里 in/out 都用**同一个显式 NATIVE 布局（前 N 个声道全掩码）**：
             //   in==out ⇒ 声道映射恒等 ⇒ 只做"格式 + planar/interleaved"转换，语义与原来完全一致，
             //   但 swr 内部有了明确的声道定义，不再踩 UNSPEC。
-            AVChannelLayout explicitLayout = {0};
+            AVChannelLayout explicitLayout = {};
             explicitLayout.order = AV_CHANNEL_ORDER_NATIVE;
             explicitLayout.nb_channels = channelCount;
             explicitLayout.u.mask = (channelCount >= 64) ? ~0ULL : ((1ULL << channelCount) - 1);
