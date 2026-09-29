@@ -81,23 +81,36 @@ static int copyFrameToInterleaved(const AVFrame *frame, uint8_t *dst, int dstSiz
     const int outB = av_get_bytes_per_sample(outFmt);
     if (inB <= 0 || !frame->data[0]) return -2;
     const int planar = av_sample_fmt_is_planar(inFmt);
-    // 越界前先把每个平面指针都验一遍：planar 时 dst 计算会拿 data[c] 做加法，
-    // 指针为 NULL 的话 `data[c] + offset` 本身已是未定义行为，不能等到循环里再判。
-    for (int c = 0; c < ch; c++) {
-        if (planar && !frame->data[c]) return -5;
+    // ★★★ FIX(2026-09-30, mb13)：**planar 必须从 `extended_data` 取平面指针**。
+    //   `AVFrame.data[]` 只有 AV_NUM_DATA_POINTERS(=8) 个槽；16 声道的 planar 帧，
+    //   第 9..16 个平面根本不在 `data` 里（恒 NULL）—— 真机 4516 次 -5 就是这么来的：
+    //     convert to interleaved failed: -5 (in_fmt=8=FLTP out_fmt=1=S16 ch=16 nb=1024)
+    //   FFmpeg 文档原文（libavutil/frame.h, extended_data）：
+    //     "Both data and extended_data will always be set, but for planar audio with
+    //      more channels that can fit in data, extended_data must be used in order
+    //      to access all channels."
+    //   所以 planar 一律用 extended_data；≤8 声道时它 == data，行为不变。
+    const uint8_t *const *planes = planar ? frame->extended_data : frame->data;
+    if (planar && !planes) return -2;
+    // 越界前先把每个平面指针都验一遍：下面是拿 planes[c] 做加法，
+    // 指针为 NULL 的话 `planes[c] + offset` 本身已是未定义行为，不能等到循环里再判。
+    if (planar) {
+        for (int c = 0; c < ch; c++) {
+            if (!planes[c]) return -5;
+        }
     }
     const size_t need = (size_t) n * (size_t) ch * (size_t) outB;
     if (need > (size_t) dstSize) return -6;
     // 同格式 + 已是 interleaved：整块拷贝。
     if (inFmt == outFmt && !planar) {
-        memcpy(dst, frame->data[0], need);
+        memcpy(dst, planes[0], need);
         return (int) need;
     }
     for (int i = 0; i < n; i++) {
         for (int c = 0; c < ch; c++) {
             const uint8_t *src = planar
-                ? frame->data[c] + (size_t) i * inB
-                : frame->data[0] + ((size_t) i * ch + c) * inB;
+                ? planes[c] + (size_t) i * inB
+                : planes[0] + ((size_t) i * ch + c) * inB;
             uint8_t *op = dst + ((size_t) i * ch + c) * outB;
             // ★ 同格式（planar 到 interleaved 的重排）：逐样本原样搬。
             //   必须走这条，不能过一遍 float —— S16→float→S16 会把 -32768 变成 -32767、
@@ -301,9 +314,15 @@ int decodePacket(AVCodecContext *context, AVPacket *packet,
                     frame, outputBuffer + outSize, outputSize - outSize,
                     context->request_sample_fmt);
             if (written < 0) {
-                LOGE("convert to interleaved failed: %d (in_fmt=%d out_fmt=%d ch=%d nb=%d)",
-                     written, frame->format, context->request_sample_fmt, ch,
-                     frame->nb_samples);
+                // ★ 去抖：这条是**每帧**都会走的路径，失败时会刷屏
+                //   （真机实测一次连播刷了 4516 行）。前 5 条全打，之后每 1000 条打一次。
+                static int diagFail = 0;
+                diagFail++;
+                if (diagFail <= 5 || diagFail % 1000 == 0) {
+                    LOGE("convert to interleaved failed: %d (in_fmt=%d out_fmt=%d ch=%d nb=%d) [x%d]",
+                         written, frame->format, context->request_sample_fmt, ch,
+                         frame->nb_samples, diagFail);
+                }
                 av_frame_free(&frame);
                 return AUDIO_DECODER_ERROR_INVALID_DATA;
             }
