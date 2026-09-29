@@ -22,7 +22,10 @@ extern "C" {
 #include <libavutil/log.h>
 #include <cstdarg>
 #include <cstring>
-#include <libswresample/swresample.h>
+// ★ 2026-09-30：本文件已**完全不使用 swresample**（见 copyFrameToInterleaved）。
+//   原来这里 include <libswresample/swresample.h>，删掉以免误以为还在走 swr。
+//   （ffcommon.h 仍 include 它，因为 ffcommon.cpp::releaseContext 会 swr_free(context->opaque)；
+//     本文件不再往 opaque 里放 SwrContext，所以那条路径恒为 no-op。）
 }
 
 # define LOGD(...)  __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
@@ -72,29 +75,46 @@ static int copyFrameToInterleaved(const AVFrame *frame, uint8_t *dst, int dstSiz
     const int n = frame->nb_samples;
     if (ch <= 0 || n <= 0) return 0;
     if (outFmt != AV_SAMPLE_FMT_S16 && outFmt != AV_SAMPLE_FMT_FLT) return -1;
+    if (!dst || dstSize < 0) return -3;
     const enum AVSampleFormat inFmt = (enum AVSampleFormat) frame->format;
     const int inB = av_get_bytes_per_sample(inFmt);
     const int outB = av_get_bytes_per_sample(outFmt);
     if (inB <= 0 || !frame->data[0]) return -2;
-    const int need = n * ch * outB;
-    if (need > dstSize) return -3;
     const int planar = av_sample_fmt_is_planar(inFmt);
+    // 越界前先把每个平面指针都验一遍：planar 时 dst 计算会拿 data[c] 做加法，
+    // 指针为 NULL 的话 `data[c] + offset` 本身已是未定义行为，不能等到循环里再判。
+    for (int c = 0; c < ch; c++) {
+        if (planar && !frame->data[c]) return -5;
+    }
+    const size_t need = (size_t) n * (size_t) ch * (size_t) outB;
+    if (need > (size_t) dstSize) return -6;
+    // 同格式 + 已是 interleaved：整块拷贝。
+    if (inFmt == outFmt && !planar) {
+        memcpy(dst, frame->data[0], need);
+        return (int) need;
+    }
     for (int i = 0; i < n; i++) {
         for (int c = 0; c < ch; c++) {
             const uint8_t *src = planar
                 ? frame->data[c] + (size_t) i * inB
                 : frame->data[0] + ((size_t) i * ch + c) * inB;
-            if (!src) return -5;
+            uint8_t *op = dst + ((size_t) i * ch + c) * outB;
+            // ★ 同格式（planar 到 interleaved 的重排）：逐样本原样搬。
+            //   必须走这条，不能过一遍 float —— S16→float→S16 会把 -32768 变成 -32767、
+            //   且每个样本都可能差 1 LSB（有损）；FLT→FLT 过 float 虽然位模式相同，但没必要。
+            if (inFmt == outFmt) {
+                memcpy(op, src, (size_t) outB);
+                continue;
+            }
             float v;
             switch (inFmt) {
                 case AV_SAMPLE_FMT_FLTP: case AV_SAMPLE_FMT_FLT: { float t; memcpy(&t, src, 4); v = t; break; }
                 case AV_SAMPLE_FMT_S16P: case AV_SAMPLE_FMT_S16: { int16_t t; memcpy(&t, src, 2); v = t / 32768.0f; break; }
                 case AV_SAMPLE_FMT_S32P: case AV_SAMPLE_FMT_S32: { int32_t t; memcpy(&t, src, 4); v = (float) (t / 2147483648.0); break; }
                 case AV_SAMPLE_FMT_DBLP: case AV_SAMPLE_FMT_DBL: { double t; memcpy(&t, src, 8); v = (float) t; break; }
-                case AV_SAMPLE_FMT_U8P:  case AV_SAMPLE_FMT_U8:  v = (*src - 128.0f) / 128.0f; break;
+                case AV_SAMPLE_FMT_U8P:  case AV_SAMPLE_FMT_U8:  v = ((int) (*src) - 128) / 128.0f; break;
                 default: return -4;
             }
-            uint8_t *op = dst + ((size_t) i * ch + c) * outB;
             if (outFmt == AV_SAMPLE_FMT_S16) {
                 float scaled = v * 32767.0f;
                 int si = (int) (scaled + (scaled >= 0 ? 0.5f : -0.5f));
@@ -106,7 +126,7 @@ static int copyFrameToInterleaved(const AVFrame *frame, uint8_t *dst, int dstSiz
             }
         }
     }
-    return need;
+    return (int) need;
 }
 
 int decodePacket(AVCodecContext *context, AVPacket *packet,
@@ -174,6 +194,12 @@ AVCodecContext *createContext(JNIEnv *env, AVCodec *codec, jbyteArray extraData,
         releaseContext(context);
         return nullptr;
     }
+    // ★ 不变量(2026-09-30)：自写转换只产出 S16 / FLT，而 Java 侧（FfmpegAudioDecoder /
+    //   FfmpegAudioRenderer）是按"它请求的格式"去解释输出缓冲的字节数的。
+    //   `request_sample_fmt` 是"请求"字段，avcodec_open2 只会改 `sample_fmt`（解码器实际输出），
+    //   不会覆盖 request；这里显式重申一次，保证上面那个约定成立、不会被后续改动悄悄破坏。
+    context->request_sample_fmt =
+            outputFloat ? OUTPUT_FORMAT_PCM_FLOAT : OUTPUT_FORMAT_PCM_16BIT;
     // ★ 诊断(2026-09-30)：确认 open 真的成功，并留下解码器的关键状态
     LOGD("diag: avcodec_open2 OK | codec=%s ch=%d rate=%d extradata=%d sample_fmt=%d",
          codec->name, context->ch_layout.nb_channels, context->sample_rate,
@@ -252,23 +278,43 @@ int decodePacket(AVCodecContext *context, AVPacket *packet,
         // ★★★ FIX(2026-09-30)：**绕开 swresample**（它对 >8 声道必崩）。
         //   解码器输出即目标采样率与声道数，只需 planar/interleaved + 位深转换。
         {
+            const int ch = frame->ch_layout.nb_channels;
             const int outB = av_get_bytes_per_sample(context->request_sample_fmt);
-            const int need = frame->nb_samples * channelCount * outB;
+            const int need = frame->nb_samples * ch * outB;
             if (need > 0 && outSize + need > outputSize) {
                 // growBuffer 返回**缓冲区基址**，所以要把已写部分 outSize 的偏移加回去。
-                outputBuffer = growBuffer(outSize + need);
+                const int newSize = outSize + need;
+                LOGD("Output buffer size (%d) too small for output data (%d), reallocating buffer.",
+                     outputSize, newSize);
+                outputBuffer = growBuffer(newSize);
                 if (!outputBuffer) {
                     LOGE("Failed to reallocate output buffer.");
                     av_frame_free(&frame);
                     return AUDIO_DECODER_ERROR_OTHER;
                 }
+                // ★ 必须同步 outputSize：它既是下一轮的增长判据，也是下面 dstSize 的上限。
+                //   不同步 ⇒ dstSize 仍是旧值 ⇒ copyFrameToInterleaved 返回"空间不足"，
+                //   表现成"解码出帧但立刻报错"，很难往缓冲簿记上想。
+                outputSize = newSize;
             }
-            int written = copyFrameToInterleaved(frame, outputBuffer + outSize, outputSize - outSize,
-                                                 context->request_sample_fmt);
+            const int written = copyFrameToInterleaved(
+                    frame, outputBuffer + outSize, outputSize - outSize,
+                    context->request_sample_fmt);
             if (written < 0) {
-                LOGE("convert to interleaved failed: %d", written);
+                LOGE("convert to interleaved failed: %d (in_fmt=%d out_fmt=%d ch=%d nb=%d)",
+                     written, frame->format, context->request_sample_fmt, ch,
+                     frame->nb_samples);
                 av_frame_free(&frame);
                 return AUDIO_DECODER_ERROR_INVALID_DATA;
+            }
+            // ★ 诊断(2026-09-30)：确认自写转换真的跑起来了，以及它的入/出格式。
+            {
+                static int diagConv = 0;
+                if (diagConv++ < 3) {
+                    LOGD("diag: 自写转换 #%d in_fmt=%d out_fmt=%d ch=%d nb=%d bytes=%d",
+                         diagConv, frame->format, context->request_sample_fmt, ch,
+                         frame->nb_samples, written);
+                }
             }
             av_frame_free(&frame);
             outSize += written;
