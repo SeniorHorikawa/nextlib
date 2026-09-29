@@ -25,7 +25,10 @@ final class FfmpegAudioDecoder
     extends SimpleDecoder<DecoderInputBuffer, SimpleDecoderOutputBuffer, FfmpegDecoderException> {
 
   // Output buffer sizes when decoding PCM mu-law streams, which is the maximum FFmpeg outputs.
-  private static final int INITIAL_OUTPUT_BUFFER_SIZE_16BIT = 65535;
+  // ★ FIX(2026-09-30): 原值 65535/131070 是按 <=8 声道取的，16 声道 x 2048 块长需要
+  //   65536 / 131072 —— 恰好差 1~2 字节；装不下时 native 返回 0，被 decode() 当作
+  //   "无需输出"静默跳过（且 growOutputBuffer 的调用路径形同虚设）。抬到能覆盖 64 声道。
+  private static final int INITIAL_OUTPUT_BUFFER_SIZE_16BIT = 1 << 18;
   private static final int INITIAL_OUTPUT_BUFFER_SIZE_32BIT = INITIAL_OUTPUT_BUFFER_SIZE_16BIT * 2;
 
   private static final int AUDIO_DECODER_ERROR_INVALID_DATA = -1;
@@ -198,19 +201,61 @@ final class FfmpegAudioDecoder
     return alacAtom.array();
   }
 
+  /**
+   * Vorbis extradata —— ★ FIX(2026-09-30)。
+   *
+   * FFmpeg 期望的布局是 {@code [头数-1][len1][len2][头1][头2][头3]}（与 ffmpeg 自己
+   * ogg→mkv 时写出的 CodecPrivate 一致）。原实现写成
+   * {@code [len(id)][id][00 00][len(setup)][setup]}，而 FFmpeg 是用
+   * {@code overhead = extraData[2..3]} 去定位**第三段头**的 —— 它把 id 头放在 offset 2，
+   * 于是 overhead 恒等于 id 头前两字节 {@code 0x01 0x76} = 374，第三段头被指到 offset 406，
+   * 落在 setup 头**内部**，FFmpeg 直接报
+   * {@code Third header is not the setup header} / {@code Setup header is too short}。
+   * 结果是解码器 avcodec_open2 成功、却一帧都不出（也没有异常），
+   * 上层表现为"永远无声"。≥16 声道的 Vorbis 才会踩到（<=8 声道由平台解码器处理，不走这条路）。
+   *
+   * Media3 只提供 id + setup 两段头，所以这里补一个最小合法的 comment 头占位。
+   */
   private static byte[] getVorbisExtraData(List<byte[]> initializationData) {
-    byte[] header0 = initializationData.get(0);
-    byte[] header1 = initializationData.get(1);
-    byte[] extraData = new byte[header0.length + header1.length + 6];
-    extraData[0] = (byte) (header0.length >> 8);
-    extraData[1] = (byte) (header0.length & 0xFF);
-    System.arraycopy(header0, 0, extraData, 2, header0.length);
-    extraData[header0.length + 2] = 0;
-    extraData[header0.length + 3] = 0;
-    extraData[header0.length + 4] = (byte) (header1.length >> 8);
-    extraData[header0.length + 5] = (byte) (header1.length & 0xFF);
-    System.arraycopy(header1, 0, extraData, header0.length + 6, header1.length);
+    byte[] idHeader = initializationData.get(0);
+    byte[] setupHeader = initializationData.get(1);
+    byte[] commentHeader = minimalVorbisCommentHeader();
+    byte[] extraData =
+        new byte[3 + idHeader.length + commentHeader.length + setupHeader.length];
+    extraData[0] = 2; // 头数 - 1
+    extraData[1] = (byte) idHeader.length; // 1 字节长度字段 => 必须 <= 255
+    extraData[2] = (byte) commentHeader.length;
+    System.arraycopy(idHeader, 0, extraData, 3, idHeader.length);
+    System.arraycopy(commentHeader, 0, extraData, 3 + idHeader.length, commentHeader.length);
+    System.arraycopy(
+        setupHeader, 0, extraData, 3 + idHeader.length + commentHeader.length, setupHeader.length);
     return extraData;
+  }
+
+  /**
+   * 最小合法的 Vorbis comment 头：
+   * {@code \x03vorbis + vendor 长度(LE) + vendor + 注释条数(LE, 0) + framing bit}。
+   * FFmpeg 只严格要求第三段是 setup 头，这段只是把布局填补完整。
+   */
+  private static byte[] minimalVorbisCommentHeader() {
+    byte[] vendor = "NextLib".getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+    byte[] header = new byte[7 + 4 + vendor.length + 4 + 1];
+    header[0] = 3;
+    System.arraycopy(
+        "vorbis".getBytes(java.nio.charset.StandardCharsets.US_ASCII), 0, header, 1, 6);
+    int p = 7;
+    header[p++] = (byte) (vendor.length & 0xFF);
+    header[p++] = (byte) ((vendor.length >> 8) & 0xFF);
+    header[p++] = (byte) ((vendor.length >> 16) & 0xFF);
+    header[p++] = (byte) ((vendor.length >> 24) & 0xFF);
+    System.arraycopy(vendor, 0, header, p, vendor.length);
+    p += vendor.length;
+    header[p++] = 0; // 注释条数 = 0
+    header[p++] = 0;
+    header[p++] = 0;
+    header[p++] = 0;
+    header[p] = 1; // framing bit
+    return header;
   }
 
   private native long ffmpegInitialize(
