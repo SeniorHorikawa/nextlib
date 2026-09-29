@@ -19,6 +19,8 @@ extern "C" {
 #include <libavutil/channel_layout.h>
 #include <libavutil/error.h>
 #include <libavutil/opt.h>
+#include <libavutil/log.h>
+#include <cstdarg>
 #include <libswresample/swresample.h>
 }
 
@@ -40,6 +42,14 @@ static jmethodID growOutputBufferMethod;
  * provided extraData as initialization data for the decoder if it is non-NULL.
  * Returns the created context.
  */
+// ★ 诊断(2026-09-30)：把 FFmpeg 自己的 av_log 转发到 logcat（之前完全看不到 FFmpeg 说了什么）
+static void mbAvLogCallback(void *avcl, int level, const char *fmt, va_list vl) {
+    if (level > AV_LOG_INFO) return;
+    char line[512];
+    vsnprintf(line, sizeof(line), fmt, vl);
+    __android_log_print(ANDROID_LOG_WARN, LOG_TAG, "avlog: %s", line);
+}
+
 AVCodecContext *createContext(JNIEnv *env, AVCodec *codec, jbyteArray extraData,
                               jboolean outputFloat, jint rawSampleRate,
                               jint rawChannelCount);
@@ -78,6 +88,7 @@ uint8_t *GrowOutputBufferCallback::operator()(int requiredSize) const {
 AVCodecContext *createContext(JNIEnv *env, AVCodec *codec, jbyteArray extraData,
                               jboolean outputFloat, jint rawSampleRate,
                               jint rawChannelCount) {
+    av_log_set_callback(mbAvLogCallback);
     AVCodecContext *context = avcodec_alloc_context3(codec);
     if (!context) {
         LOGE("Failed to allocate context.");
