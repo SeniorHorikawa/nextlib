@@ -2,6 +2,7 @@
 #include <android/log.h>
 #include <jni.h>
 #include <cstdlib>
+#include <cstdio>
 #include <android/native_window_jni.h>
 #include <algorithm>
 #include "ffcommon.h"
@@ -109,17 +110,45 @@ AVCodecContext *createContext(JNIEnv *env, AVCodec *codec, jbyteArray extraData,
         releaseContext(context);
         return nullptr;
     }
+    // ★ 诊断(2026-09-30)：确认 open 真的成功，并留下解码器的关键状态
+    LOGD("diag: avcodec_open2 OK | codec=%s ch=%d rate=%d extradata=%d sample_fmt=%d",
+         codec->name, context->ch_layout.nb_channels, context->sample_rate,
+         context->extradata_size, context->sample_fmt);
     return context;
 }
 
 int decodePacket(AVCodecContext *context, AVPacket *packet,
                  uint8_t *outputBuffer, int outputSize, GrowOutputBufferCallback growBuffer) {
     int result = 0;
+    // ★ 诊断(2026-09-30)：头 8 个输入包打 size + 首 12 字节。
+    //   判读：首字节 01/03/05 + "vorbis" ⇒ 喂进去的其实是三段头（上游解封装的问题）；
+    //         size=0 或极小 ⇒ 空包；其余 ⇒ 包本身正常，问题在解码器侧。
+    {
+        static int diagIn = 0;
+        if (diagIn < 8) {
+            const uint8_t *d = (const uint8_t *) packet->data;
+            int n = packet->size;
+            char first[64] = {0};
+            int lim = n < 12 ? n : 12;
+            if (lim < 0) lim = 0;
+            for (int k = 0; k < lim; k++) {
+                snprintf(first + k * 3, 4, "%02x ", d[k]);
+            }
+            LOGD("diag: 输入包 #%d size=%d 首%d字节=%s", diagIn + 1, n, lim, first);
+            diagIn++;
+        }
+    }
     // Queue input data.
     result = avcodec_send_packet(context, packet);
     if (result) {
         logError("avcodec_send_packet", result);
         return transformError(result);
+    }
+    {
+        static int diagSend = 0;
+        if (diagSend++ < 3) {
+            LOGD("diag: send_packet OK #%d", diagSend);
+        }
     }
 
     // Dequeue output data until it runs out.
