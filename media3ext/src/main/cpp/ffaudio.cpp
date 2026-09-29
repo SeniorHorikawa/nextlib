@@ -21,6 +21,7 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/log.h>
 #include <cstdarg>
+#include <cstring>
 #include <libswresample/swresample.h>
 }
 
@@ -59,6 +60,55 @@ AVCodecContext *createContext(JNIEnv *env, AVCodec *codec, jbyteArray extraData,
  * written, or a negative AUDIO_DECODER_ERROR constant value in the case of an
  * error.
  */
+// ★★★ FIX(2026-09-30)：**自己把 AVFrame 转成 interleaved PCM，不依赖 swresample。**
+//   为什么：swresample 在 >8 声道（FFmpeg 给的是 AV_CHANNEL_ORDER_UNSPEC 布局）下必崩 ——
+//   真机栈顶恒为 `swr_convert+1892`；换显式 NATIVE 布局也无效。
+//   而这里只需要"采样率不变、声道数不变"的 **planar <-> interleaved + 位深转换**，
+//   自己写就够，且彻底避开 swr 的声道布局处理。in/out 声道顺序恒等。
+//   @return 写入字节数；负值 = 不支持/空间不足
+static int copyFrameToInterleaved(const AVFrame *frame, uint8_t *dst, int dstSize,
+                                  enum AVSampleFormat outFmt) {
+    const int ch = frame->ch_layout.nb_channels;
+    const int n = frame->nb_samples;
+    if (ch <= 0 || n <= 0) return 0;
+    if (outFmt != AV_SAMPLE_FMT_S16 && outFmt != AV_SAMPLE_FMT_FLT) return -1;
+    const enum AVSampleFormat inFmt = (enum AVSampleFormat) frame->format;
+    const int inB = av_get_bytes_per_sample(inFmt);
+    const int outB = av_get_bytes_per_sample(outFmt);
+    if (inB <= 0 || !frame->data[0]) return -2;
+    const int need = n * ch * outB;
+    if (need > dstSize) return -3;
+    const int planar = av_sample_fmt_is_planar(inFmt);
+    for (int i = 0; i < n; i++) {
+        for (int c = 0; c < ch; c++) {
+            const uint8_t *src = planar
+                ? frame->data[c] + (size_t) i * inB
+                : frame->data[0] + ((size_t) i * ch + c) * inB;
+            if (!src) return -5;
+            float v;
+            switch (inFmt) {
+                case AV_SAMPLE_FMT_FLTP: case AV_SAMPLE_FMT_FLT: { float t; memcpy(&t, src, 4); v = t; break; }
+                case AV_SAMPLE_FMT_S16P: case AV_SAMPLE_FMT_S16: { int16_t t; memcpy(&t, src, 2); v = t / 32768.0f; break; }
+                case AV_SAMPLE_FMT_S32P: case AV_SAMPLE_FMT_S32: { int32_t t; memcpy(&t, src, 4); v = (float) (t / 2147483648.0); break; }
+                case AV_SAMPLE_FMT_DBLP: case AV_SAMPLE_FMT_DBL: { double t; memcpy(&t, src, 8); v = (float) t; break; }
+                case AV_SAMPLE_FMT_U8P:  case AV_SAMPLE_FMT_U8:  v = (*src - 128.0f) / 128.0f; break;
+                default: return -4;
+            }
+            uint8_t *op = dst + ((size_t) i * ch + c) * outB;
+            if (outFmt == AV_SAMPLE_FMT_S16) {
+                float scaled = v * 32767.0f;
+                int si = (int) (scaled + (scaled >= 0 ? 0.5f : -0.5f));
+                if (si > 32767) si = 32767; else if (si < -32768) si = -32768;
+                int16_t o = (int16_t) si;
+                memcpy(op, &o, 2);
+            } else {
+                memcpy(op, &v, 4);
+            }
+        }
+    }
+    return need;
+}
+
 int decodePacket(AVCodecContext *context, AVPacket *packet,
                  uint8_t *outputBuffer, int outputSize);
 
@@ -199,95 +249,30 @@ int decodePacket(AVCodecContext *context, AVPacket *packet,
                  frame->nb_samples, frame->format, frame->ch_layout.nb_channels);
         }
 
-        // Resample output.
-        AVSampleFormat sampleFormat = context->sample_fmt;
-        int channelCount = context->ch_layout.nb_channels;
-        int sampleRate = context->sample_rate;
-        int sampleCount = frame->nb_samples;
-        int dataSize = av_samples_get_buffer_size(nullptr, channelCount, sampleCount,
-                                                  sampleFormat, 1);
-        // ★★★ FIX(2026-09-30)：这里原来是
-        //     `int channelLayout = (int) context->ch_layout.u.mask;`
-        //     + `swr_alloc()` + `av_opt_set_int(…, "in_channel_layout", channelLayout, …)`。
-        //   `u.mask` 只在 `order == AV_CHANNEL_ORDER_NATIVE` 时才有意义；
-        //   **≥9 声道走 `av_channel_layout_default()` 的 UNSPEC 分支，`u.mask` 恒为 0**
-        //   （16 声道那条流被本机 ffmpeg 显示成 `hexadecagonal`，正是 UNSPEC-16 的名字）
-        //   ⇒ 老代码会给 swr 传一个"未设置"的声道布局。
-        //   官方 Media3 1.5.1 早已把这段换成 `swr_alloc_set_opts2(&…, &context->ch_layout, …)`，
-        //   直接传 `AVChannelLayout` 结构（能表达 UNSPEC/CUSTOM），这里照抄官方实现。
-        SwrContext *resampleContext = static_cast<SwrContext *>(context->opaque);
-        if (!resampleContext) {
-            // ★★★ FIX(2026-09-30)：**给 swr 一个显式的声道布局**。
-            //   FFmpeg 对 >8 声道走 `av_channel_layout_default()` 的 **UNSPEC** 分支
-            //   （没有具体声道定义，`u.mask` 也只是 0/无效），swresample 拿它算地址会崩 ——
-            //   真机栈顶 `swr_convert+1892`、寄存器里还留着布局名 "hexadecagonal" 的 ASCII。
-            //   这里 in/out 都用**同一个显式 NATIVE 布局（前 N 个声道全掩码）**：
-            //   in==out ⇒ 声道映射恒等 ⇒ 只做"格式 + planar/interleaved"转换，语义与原来完全一致，
-            //   但 swr 内部有了明确的声道定义，不再踩 UNSPEC。
-            AVChannelLayout explicitLayout = {};
-            explicitLayout.order = AV_CHANNEL_ORDER_NATIVE;
-            explicitLayout.nb_channels = channelCount;
-            explicitLayout.u.mask = (channelCount >= 64) ? ~0ULL : ((1ULL << channelCount) - 1);
-            result = swr_alloc_set_opts2(&resampleContext,             // ps
-                                         &explicitLayout,               // out_ch_layout
-                                         context->request_sample_fmt,  // out_sample_fmt
-                                         sampleRate,                   // out_sample_rate
-                                         &explicitLayout,               // in_ch_layout
-                                         sampleFormat,                 // in_sample_fmt
-                                         sampleRate,                   // in_sample_rate
-                                         0,                            // log_offset
-                                         nullptr                       // log_ctx
-            );
-            if (result < 0) {
-                logError("swr_alloc_set_opts2", result);
-                av_frame_free(&frame);
-                return transformError(result);
+        // ★★★ FIX(2026-09-30)：**绕开 swresample**（它对 >8 声道必崩）。
+        //   解码器输出即目标采样率与声道数，只需 planar/interleaved + 位深转换。
+        {
+            const int outB = av_get_bytes_per_sample(context->request_sample_fmt);
+            const int need = frame->nb_samples * channelCount * outB;
+            if (need > 0 && outSize + need > outputSize) {
+                // growBuffer 返回**缓冲区基址**，所以要把已写部分 outSize 的偏移加回去。
+                outputBuffer = growBuffer(outSize + need);
+                if (!outputBuffer) {
+                    LOGE("Failed to reallocate output buffer.");
+                    av_frame_free(&frame);
+                    return AUDIO_DECODER_ERROR_OTHER;
+                }
             }
-            result = swr_init(resampleContext);
-            if (result < 0) {
-                logError("swr_init", result);
+            int written = copyFrameToInterleaved(frame, outputBuffer + outSize, outputSize - outSize,
+                                                 context->request_sample_fmt);
+            if (written < 0) {
+                LOGE("convert to interleaved failed: %d", written);
                 av_frame_free(&frame);
-                return transformError(result);
+                return AUDIO_DECODER_ERROR_INVALID_DATA;
             }
-            context->opaque = resampleContext;
+            av_frame_free(&frame);
+            outSize += written;
         }
-        int inSampleSize = av_get_bytes_per_sample(sampleFormat);
-        int outSampleSize = av_get_bytes_per_sample(context->request_sample_fmt);
-        int outSamples = swr_get_out_samples(resampleContext, sampleCount);
-        int bufferOutSize = outSampleSize * channelCount * outSamples;
-        if (outSize + bufferOutSize > outputSize) {
-            LOGD(
-                    "Output buffer size (%d) too small for output data (%d), "
-                    "reallocating buffer.",
-                    outputSize, outSize + bufferOutSize);
-            outputSize = outSize + bufferOutSize;
-            outputBuffer = growBuffer(outputSize);
-            if (!outputBuffer) {
-                LOGE("Failed to reallocate output buffer.");
-                av_frame_free(&frame);
-                return AUDIO_DECODER_ERROR_OTHER;
-            }
-        }
-        // ★★★ FIX(2026-09-30)：`swr_convert` 的第 3 个参数是 **每声道样本数**，
-        //   原代码传的是 `bufferOutSize`（= outSampleSize * channelCount * outSamples，**字节数**）——
-        //   多声道时被放大的倍数正是"每帧字节数"（16 声道 16-bit = 32 倍），
-        //   swr 按这个错误容量做地址运算 → 真机 SIGSEGV（栈顶 swr_convert+1892）。
-        //   低声道数时因为"输出样本数受输入样本数限制"侥幸不炸，所以上游长期未暴露。
-        result = swr_convert(resampleContext, &outputBuffer, outSamples,
-                             (const uint8_t **) frame->data, frame->nb_samples);
-        av_frame_free(&frame);
-        if (result < 0) {
-            logError("swr_convert", result);
-            return AUDIO_DECODER_ERROR_INVALID_DATA;
-        }
-        int available = swr_get_out_samples(resampleContext, 0);
-        if (available != 0) {
-            LOGE("Expected no samples remaining after resampling, but found %d.",
-                 available);
-            return AUDIO_DECODER_ERROR_INVALID_DATA;
-        }
-        outputBuffer += bufferOutSize;
-        outSize += bufferOutSize;
     }
     return outSize;
 }
