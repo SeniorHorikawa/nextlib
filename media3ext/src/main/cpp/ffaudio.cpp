@@ -103,7 +103,10 @@ AVCodecContext *createContext(JNIEnv *env, AVCodec *codec, jbyteArray extraData,
         context->ch_layout.nb_channels = rawChannelCount;
         av_channel_layout_default(&context->ch_layout, rawChannelCount);
     }
-    context->err_recognition = AV_EF_IGNORE_ERR;
+    // ★ 诊断(2026-09-30)：**不再吞掉解码器错误**。原值 AV_EF_IGNORE_ERR 会把解码器报的错
+    //   全部静默掉 —— 如果 Vorbis 每帧都失败，就会表现成"无帧、无错"（正是我们查到的现象）。
+    //   改成 0（默认）让 FFmpeg 把真正的原因打进 logcat。确认原因后再决定是否恢复。
+    context->err_recognition = 0;
     int result = avcodec_open2(context, codec, nullptr);
     if (result < 0) {
         logError("avcodec_open2", result);
