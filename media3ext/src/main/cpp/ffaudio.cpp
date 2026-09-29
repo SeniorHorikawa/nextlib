@@ -124,6 +124,11 @@ int decodePacket(AVCodecContext *context, AVPacket *packet,
 
     // Dequeue output data until it runs out.
     int outSize = 0;
+    // ★ 诊断（2026-09-30）：定位"解码器吃了输入却不出帧"。
+    //   Java 侧只能看到 `入队>0 / 出帧=0`，看不到 native 为什么不出 —— 这几行就是补那个洞。
+    //   每条计数只打有限条，避免刷屏（与工程里"高频日志必须去抖"同一条原则）。
+    static int diagEagain = 0;
+    static int diagFrames = 0;
     while (true) {
         AVFrame *frame = av_frame_alloc();
         if (!frame) {
@@ -134,33 +139,56 @@ int decodePacket(AVCodecContext *context, AVPacket *packet,
         if (result) {
             av_frame_free(&frame);
             if (result == AVERROR(EAGAIN)) {
+                if (diagEagain++ < 5) {
+                    LOGD("diag: receive_frame=EAGAIN #%d | codec_id=%d sample_fmt=%d "
+                         "ch=%d rate=%d extradata=%d req_fmt=%d",
+                         diagEagain, context->codec_id, context->sample_fmt,
+                         context->ch_layout.nb_channels, context->sample_rate,
+                         context->extradata_size, context->request_sample_fmt);
+                }
                 break;
             }
             logError("avcodec_receive_frame", result);
             return transformError(result);
         }
+        if (diagFrames++ < 3) {
+            LOGD("diag: 出帧 #%d nb_samples=%d fmt=%d ch=%d", diagFrames,
+                 frame->nb_samples, frame->format, frame->ch_layout.nb_channels);
+        }
 
         // Resample output.
         AVSampleFormat sampleFormat = context->sample_fmt;
         int channelCount = context->ch_layout.nb_channels;
-        int channelLayout = (int) context->ch_layout.u.mask;
         int sampleRate = context->sample_rate;
         int sampleCount = frame->nb_samples;
         int dataSize = av_samples_get_buffer_size(nullptr, channelCount, sampleCount,
                                                   sampleFormat, 1);
-        SwrContext *resampleContext;
-        if (context->opaque) {
-            resampleContext = (SwrContext *) context->opaque;
-        } else {
-            resampleContext = swr_alloc();
-            av_opt_set_int(resampleContext, "in_channel_layout", channelLayout, 0);
-            av_opt_set_int(resampleContext, "out_channel_layout", channelLayout, 0);
-            av_opt_set_int(resampleContext, "in_sample_rate", sampleRate, 0);
-            av_opt_set_int(resampleContext, "out_sample_rate", sampleRate, 0);
-            av_opt_set_int(resampleContext, "in_sample_fmt", sampleFormat, 0);
-            // The output format is always the requested format.
-            av_opt_set_int(resampleContext, "out_sample_fmt",
-                           context->request_sample_fmt, 0);
+        // ★★★ FIX(2026-09-30)：这里原来是
+        //     `int channelLayout = (int) context->ch_layout.u.mask;`
+        //     + `swr_alloc()` + `av_opt_set_int(…, "in_channel_layout", channelLayout, …)`。
+        //   `u.mask` 只在 `order == AV_CHANNEL_ORDER_NATIVE` 时才有意义；
+        //   **≥9 声道走 `av_channel_layout_default()` 的 UNSPEC 分支，`u.mask` 恒为 0**
+        //   （16 声道那条流被本机 ffmpeg 显示成 `hexadecagonal`，正是 UNSPEC-16 的名字）
+        //   ⇒ 老代码会给 swr 传一个"未设置"的声道布局。
+        //   官方 Media3 1.5.1 早已把这段换成 `swr_alloc_set_opts2(&…, &context->ch_layout, …)`，
+        //   直接传 `AVChannelLayout` 结构（能表达 UNSPEC/CUSTOM），这里照抄官方实现。
+        SwrContext *resampleContext = static_cast<SwrContext *>(context->opaque);
+        if (!resampleContext) {
+            result = swr_alloc_set_opts2(&resampleContext,             // ps
+                                         &context->ch_layout,          // out_ch_layout
+                                         context->request_sample_fmt,  // out_sample_fmt
+                                         sampleRate,                   // out_sample_rate
+                                         &context->ch_layout,          // in_ch_layout
+                                         sampleFormat,                 // in_sample_fmt
+                                         sampleRate,                   // in_sample_rate
+                                         0,                            // log_offset
+                                         nullptr                       // log_ctx
+            );
+            if (result < 0) {
+                logError("swr_alloc_set_opts2", result);
+                av_frame_free(&frame);
+                return transformError(result);
+            }
             result = swr_init(resampleContext);
             if (result < 0) {
                 logError("swr_init", result);
