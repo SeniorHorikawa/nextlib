@@ -221,7 +221,7 @@ int decodePacket(AVCodecContext *context, AVPacket *packet,
                                          &context->ch_layout,          // out_ch_layout
                                          context->request_sample_fmt,  // out_sample_fmt
                                          sampleRate,                   // out_sample_rate
-                                         &context->ch_layout,          // in_ch_layout
+                                         &frame->ch_layout,            // in_ch_layout
                                          sampleFormat,                 // in_sample_fmt
                                          sampleRate,                   // in_sample_rate
                                          0,                            // log_offset
@@ -257,7 +257,12 @@ int decodePacket(AVCodecContext *context, AVPacket *packet,
                 return AUDIO_DECODER_ERROR_OTHER;
             }
         }
-        result = swr_convert(resampleContext, &outputBuffer, bufferOutSize,
+        // ★★★ FIX(2026-09-30)：`swr_convert` 的第 3 个参数是 **每声道样本数**，
+        //   原代码传的是 `bufferOutSize`（= outSampleSize * channelCount * outSamples，**字节数**）——
+        //   多声道时被放大的倍数正是"每帧字节数"（16 声道 16-bit = 32 倍），
+        //   swr 按这个错误容量做地址运算 → 真机 SIGSEGV（栈顶 swr_convert+1892）。
+        //   低声道数时因为"输出样本数受输入样本数限制"侥幸不炸，所以上游长期未暴露。
+        result = swr_convert(resampleContext, &outputBuffer, outSamples,
                              (const uint8_t **) frame->data, frame->nb_samples);
         av_frame_free(&frame);
         if (result < 0) {
