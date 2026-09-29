@@ -217,11 +217,22 @@ int decodePacket(AVCodecContext *context, AVPacket *packet,
         //   直接传 `AVChannelLayout` 结构（能表达 UNSPEC/CUSTOM），这里照抄官方实现。
         SwrContext *resampleContext = static_cast<SwrContext *>(context->opaque);
         if (!resampleContext) {
+            // ★★★ FIX(2026-09-30)：**给 swr 一个显式的声道布局**。
+            //   FFmpeg 对 >8 声道走 `av_channel_layout_default()` 的 **UNSPEC** 分支
+            //   （没有具体声道定义，`u.mask` 也只是 0/无效），swresample 拿它算地址会崩 ——
+            //   真机栈顶 `swr_convert+1892`、寄存器里还留着布局名 "hexadecagonal" 的 ASCII。
+            //   这里 in/out 都用**同一个显式 NATIVE 布局（前 N 个声道全掩码）**：
+            //   in==out ⇒ 声道映射恒等 ⇒ 只做"格式 + planar/interleaved"转换，语义与原来完全一致，
+            //   但 swr 内部有了明确的声道定义，不再踩 UNSPEC。
+            AVChannelLayout explicitLayout = {0};
+            explicitLayout.order = AV_CHANNEL_ORDER_NATIVE;
+            explicitLayout.nb_channels = channelCount;
+            explicitLayout.u.mask = (channelCount >= 64) ? ~0ULL : ((1ULL << channelCount) - 1);
             result = swr_alloc_set_opts2(&resampleContext,             // ps
-                                         &context->ch_layout,          // out_ch_layout
+                                         &explicitLayout,               // out_ch_layout
                                          context->request_sample_fmt,  // out_sample_fmt
                                          sampleRate,                   // out_sample_rate
-                                         &frame->ch_layout,            // in_ch_layout
+                                         &explicitLayout,               // in_ch_layout
                                          sampleFormat,                 // in_sample_fmt
                                          sampleRate,                   // in_sample_rate
                                          0,                            // log_offset
