@@ -22,7 +22,7 @@ android {
         }
 
         ndk {
-            abiFilters += listOf("x86", "x86_64", "armeabi-v7a", "arm64-v8a")
+            abiFilters += listOf("arm64-v8a")   // ★ 只发 arm64
         }
 
         ndkVersion = "25.2.9519653"
