@@ -202,21 +202,26 @@ final class FfmpegAudioDecoder
   }
 
   /**
-   * Vorbis extradata —— ★ FIX(2026-09-30)。
+   * Vorbis extradata。
    *
-   * FFmpeg 的 {@code vorbis_decode_init()} 走的是
-   * {@code ff_vorbis_parse_setup_headers()}，而它**第一件事就是校验首字节必须等于 5**
-   * （即裸的 Vorbis setup 头 {@code \x05vorbis…}）。上游 Media3 却把 extradata 拼成
-   * {@code [len(id)][id][00 00][len(setup)][setup]}（首字节 0x00），于是 setup 头**根本没被解析**：
-   * {@code avcodec_open2} 照样返回成功，但解码器没有码本/floors/residues
-   * ⇒ {@code avcodec_receive_frame()} 永远返回 EAGAIN ⇒ **无帧、无错、永远无声**。
-   * （≤8 声道走平台解码器，所以上游这条路径几乎没人踩到。）
-   *
-   * Media3 只给两段头，其中第 2 段就是裸的 setup 头（16 声道素材实测 3799 字节、以 \x05 开头），
-   * 直接把它当 extradata 即可。
+   * ★ 2026-09-30 实测记录：FFmpeg 6.0 对这个布局 {@code avcodec_open2} **返回成功**
+   * （对照：把 extradata 换成"裸 setup 头"会被判 {@code Extradata corrupt.} 而 open 失败），
+   * 所以本布局是 FFmpeg 能接受的形态，保持与上游一致。
+   * 而"解码器配置成功却一帧不出"已另行定位到 FFmpeg 6.0 自身（同文件在本机更新的 ffmpeg 上可正常解码）。
    */
   private static byte[] getVorbisExtraData(List<byte[]> initializationData) {
-    return initializationData.get(1);
+    byte[] header0 = initializationData.get(0);
+    byte[] header1 = initializationData.get(1);
+    byte[] extraData = new byte[header0.length + header1.length + 6];
+    extraData[0] = (byte) (header0.length >> 8);
+    extraData[1] = (byte) (header0.length & 0xFF);
+    System.arraycopy(header0, 0, extraData, 2, header0.length);
+    extraData[header0.length + 2] = 0;
+    extraData[header0.length + 3] = 0;
+    extraData[header0.length + 4] = (byte) (header1.length >> 8);
+    extraData[header0.length + 5] = (byte) (header1.length & 0xFF);
+    System.arraycopy(header1, 0, extraData, header0.length + 6, header1.length);
+    return extraData;
   }
 
   private native long ffmpegInitialize(

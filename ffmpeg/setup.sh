@@ -3,7 +3,7 @@
 # Versions
 VPX_VERSION=1.13.0
 MBEDTLS_VERSION=3.4.1
-FFMPEG_VERSION=6.0
+FFMPEG_VERSION=6.1.1   # ★ 2026-09-30: 6.0 的 vorbis 解码器对 16 声道不出帧；升到与本机验证过的一代
 
 # Directories
 BASE_DIR=$(cd "$(dirname "$0")" && pwd)
